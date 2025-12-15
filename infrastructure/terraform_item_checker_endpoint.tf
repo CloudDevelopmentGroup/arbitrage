@@ -13,6 +13,7 @@ resource "aws_lambda_function" "item_checker" {
 
   environment {
     variables = {
+      # Database config is optional for item checker (not used)
       DB_HOST     = aws_db_instance.arbitrage_db.endpoint
       DB_NAME     = aws_db_instance.arbitrage_db.db_name
       DB_USER     = aws_db_instance.arbitrage_db.username
@@ -21,10 +22,7 @@ resource "aws_lambda_function" "item_checker" {
     }
   }
 
-  vpc_config {
-    subnet_ids         = data.aws_subnets.default.ids
-    security_group_ids = [aws_security_group.lambda.id]
-  }
+  # No VPC config - item checker doesn't need database access
 
   tags = {
     Name = "arbitrage-item-checker"
