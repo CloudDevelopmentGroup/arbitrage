@@ -13,11 +13,11 @@ resource "aws_lambda_function" "item_checker" {
 
   environment {
     variables = {
-      DB_HOST     = aws_db_instance.postgres.endpoint
-      DB_NAME     = aws_db_instance.postgres.db_name
-      DB_USER     = aws_db_instance.postgres.username
-      DB_PASSWORD = random_password.db_password.result
-      OPENAI_API_KEY = data.aws_secretsmanager_secret_version.api_keys.secret_string
+      DB_HOST     = aws_db_instance.arbitrage_db.endpoint
+      DB_NAME     = aws_db_instance.arbitrage_db.db_name
+      DB_USER     = aws_db_instance.arbitrage_db.username
+      DB_PASSWORD = aws_db_instance.arbitrage_db.password
+      OPENAI_API_KEY = data.aws_secretsmanager_secret.api_keys.arn
     }
   }
 
