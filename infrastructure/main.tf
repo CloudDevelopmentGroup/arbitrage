@@ -391,12 +391,12 @@ resource "aws_lambda_function" "csv_processor" {
 
   environment {
     variables = {
-      DB_HOST     = aws_db_instance.arbitrage_db.endpoint
-      DB_NAME     = aws_db_instance.arbitrage_db.db_name
-      DB_USER     = aws_db_instance.arbitrage_db.username
-      DB_PASSWORD = var.db_password
-      OPENAI_API_KEY = var.openai_api_key
-      EBAY_APP_ID = var.ebay_app_id
+      DB_HOST             = aws_db_instance.arbitrage_db.endpoint
+      DB_NAME             = aws_db_instance.arbitrage_db.db_name
+      DB_USER             = aws_db_instance.arbitrage_db.username
+      DB_PASSWORD         = var.db_password
+      SQS_QUEUE_URL       = aws_sqs_queue.item_analysis_queue.url
+      API_KEYS_SECRET_ARN = data.aws_secretsmanager_secret.api_keys.arn
     }
   }
 
@@ -501,6 +501,13 @@ resource "aws_iam_role_policy" "lambda_policy" {
           "ec2:DeleteNetworkInterface"
         ]
         Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:GetSecretValue"
+        ]
+        Resource = data.aws_secretsmanager_secret.api_keys.arn
       }
     ]
   })
@@ -650,6 +657,19 @@ variable "openai_api_key" {
   description = "OpenAI API key for AI analysis"
   type        = string
   sensitive   = true
+  default     = ""
+}
+
+variable "groq_api_key" {
+  description = "Groq API key for AI analysis (deprecated - use Secrets Manager)"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+# Use existing Secrets Manager secret for API keys
+data "aws_secretsmanager_secret" "api_keys" {
+  name = "arbitrage/api-keys"
 }
 
 variable "ebay_app_id" {
@@ -678,4 +698,92 @@ output "s3_bucket_name" {
 
 output "db_endpoint" {
   value = aws_db_instance.arbitrage_db.endpoint
+}
+
+# SQS Queue for async item processing
+resource "aws_sqs_queue" "item_analysis_queue" {
+  name                       = "arbitrage-item-analysis-queue"
+  visibility_timeout_seconds = 900  # 15 minutes (match Lambda timeout)
+  message_retention_seconds  = 86400  # 24 hours
+  receive_wait_time_seconds  = 20  # Long polling
+  
+  # Dead letter queue for failed messages
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.item_analysis_dlq.arn
+    maxReceiveCount     = 3
+  })
+}
+
+# Dead Letter Queue for failed items
+resource "aws_sqs_queue" "item_analysis_dlq" {
+  name                      = "arbitrage-item-analysis-dlq"
+  message_retention_seconds = 1209600  # 14 days
+}
+
+# Lambda function for background item processing
+resource "aws_lambda_function" "item_processor" {
+  filename         = "item_processor.zip"
+  function_name    = "arbitrage-item-processor"
+  role            = aws_iam_role.lambda_role.arn
+  handler         = "item_processor.lambda_handler"
+  source_code_hash = filebase64sha256("item_processor.zip")
+  runtime         = "python3.9"
+  timeout         = 900  # 15 minutes
+  memory_size     = 512
+
+  environment {
+    variables = {
+      DB_HOST             = aws_db_instance.arbitrage_db.endpoint
+      DB_NAME             = "arbitrage"
+      DB_USER             = "arbitrage_user"
+      DB_PASSWORD         = var.db_password
+      API_KEYS_SECRET_ARN = data.aws_secretsmanager_secret.api_keys.arn
+    }
+  }
+
+  layers = [
+    "arn:aws:lambda:us-east-1:784289278185:layer:psycopg2-binary-v2:1"
+  ]
+}
+
+# SQS trigger for Lambda
+resource "aws_lambda_event_source_mapping" "sqs_trigger" {
+  event_source_arn = aws_sqs_queue.item_analysis_queue.arn
+  function_name    = aws_lambda_function.item_processor.arn
+  batch_size       = 1  # Process one item at a time
+  enabled          = true
+  
+  # OpenAI has better rate limits - 10 concurrent for faster processing
+  scaling_config {
+    maximum_concurrency = 10
+  }
+}
+
+# Add SQS permissions to Lambda role
+resource "aws_iam_role_policy" "lambda_sqs_policy" {
+  name = "lambda-sqs-policy"
+  role = aws_iam_role.lambda_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "sqs:ReceiveMessage",
+          "sqs:DeleteMessage",
+          "sqs:GetQueueAttributes",
+          "sqs:SendMessage"
+        ]
+        Resource = [
+          aws_sqs_queue.item_analysis_queue.arn,
+          aws_sqs_queue.item_analysis_dlq.arn
+        ]
+      }
+    ]
+  })
+}
+
+output "sqs_queue_url" {
+  value = aws_sqs_queue.item_analysis_queue.url
 }

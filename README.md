@@ -45,13 +45,21 @@ This platform allows users to upload CSV manifests from liquidation companies an
   - Costco liquidation
   - Generic product manifests
 
-### 2. AI-Powered Analysis
+### 2. Single Item Checker ✨ NEW
+- Quick analysis for individual items without CSV upload
+- Manual entry of item details (title, MSRP, quantity, notes)
+- Instant AI-powered resale analysis
+- Purchase price recommendations (30% of sale price)
+- ROI calculations for bulk purchases
+- No database persistence - perfect for quick checks
+
+### 3. AI-Powered Analysis
 - Intelligent item categorization and demand assessment
 - Realistic liquidation pricing (15-50% of MSRP)
 - Sales time estimation based on item characteristics
 - Profit margin calculations based on liquidation purchase costs
 
-### 3. Marketplace Integration
+### 4. Marketplace Integration
 - Amazon product availability and pricing
 - eBay product availability and pricing
 - Concurrent API calls for performance optimization
@@ -156,10 +164,13 @@ aws s3 sync build/ s3://arby-sndflo-com --delete
 
 ### ✅ Completed Features
 - Universal CSV parsing for multiple formats
+- **Single item checker with quick analysis** ✨ NEW
 - AI-powered analysis with realistic pricing
 - Amazon and eBay marketplace integration
 - Image search and processing
 - Frontend with interactive results
+- Upload history and management
+- Async processing with real-time progress
 - Database persistence
 - CORS configuration
 - Profit margin calculations
@@ -174,12 +185,18 @@ aws s3 sync build/ s3://arby-sndflo-com --delete
 - Enhanced marketplace API reliability
 - Additional liquidation company formats
 - Advanced filtering and search capabilities
-- Bulk analysis features
 - Export functionality for results
+- Image upload for single item checker
+- Batch single items comparison
+- Price alerts and monitoring
 
 ## API Endpoints
 
 - `POST /prod/upload` - Upload and analyze CSV manifests
+- `POST /prod/check-item` - Analyze a single item without CSV upload
+- `GET /prod/status/{uploadId}` - Check processing status of an upload
+- `GET /prod/history` - Retrieve upload history
+- `DELETE /prod/upload/{uploadId}` - Delete an upload
 - `GET /prod/results/{manifestId}` - Retrieve saved analysis results
 
 ## Environment Variables

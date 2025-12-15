@@ -19,8 +19,44 @@ from amazon_paapi import AmazonApi
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
+# Cache for API keys from Secrets Manager
+_api_keys_cache = None
+
+def get_api_keys():
+    """Get API keys from Secrets Manager (with caching)"""
+    global _api_keys_cache
+    
+    if _api_keys_cache:
+        return _api_keys_cache
+    
+    # Try to get from Secrets Manager first
+    secret_arn = os.environ.get('API_KEYS_SECRET_ARN')
+    if secret_arn:
+        try:
+            client = boto3.client('secretsmanager')
+            response = client.get_secret_value(SecretId=secret_arn)
+            _api_keys_cache = json.loads(response['SecretString'])
+            logger.info("API keys loaded from Secrets Manager")
+            return _api_keys_cache
+        except Exception as e:
+            logger.warning(f"Failed to load from Secrets Manager: {str(e)}")
+    
+    # Fallback to environment variables
+    _api_keys_cache = {
+        'GROQ_API_KEY': os.environ.get('GROQ_API_KEY'),
+        'OPENAI_API_KEY': os.environ.get('OPENAI_API_KEY'),
+        'EBAY_APP_ID': os.environ.get('EBAY_APP_ID'),
+        'AMAZON_ACCESS_KEY': os.environ.get('AMAZON_ACCESS_KEY'),
+        'AMAZON_SECRET_KEY': os.environ.get('AMAZON_SECRET_KEY'),
+        'AMAZON_PARTNER_TAG': os.environ.get('AMAZON_PARTNER_TAG', 'sndflo-20'),
+        'AMAZON_REGION': os.environ.get('AMAZON_REGION', 'US'),
+    }
+    logger.info("API keys loaded from environment variables")
+    return _api_keys_cache
+
 # Initialize AWS clients
 s3_client = boto3.client('s3')
+sqs_client = boto3.client('sqs')
 
 # Database connection parameters
 DB_CONFIG = {
@@ -171,15 +207,16 @@ def parse_manifest_csv(csv_content):
         logger.info(f"Detecting CSV format from header: {header_line[:100]}...")
         
         # Detect common manifest formats with more flexible matching
-        if any(keyword in header_line for keyword in ['grainger', 'item #', 'item number', 'sku']):
-            logger.info("Detected Grainger format")
-            return parse_grainger_format(csv_file, csv_content)
-        elif any(keyword in header_line for keyword in ['upc', 'description', 'retail price', 'total retail price']):
-            logger.info("Detected liquidation format")
-            return parse_liquidation_format(csv_file, csv_content)
-        elif any(keyword in header_line for keyword in ['description', 'model', 'quantity', 'ext. retail price']):
+        # Check more specific formats first to avoid false matches
+        if all(keyword in header_line for keyword in ['description', 'model', 'ext. retail price']):
             logger.info("Detected Staples format")
             return parse_staples_format(csv_file, csv_content)
+        elif any(keyword in header_line for keyword in ['grainger', 'item #']):
+            logger.info("Detected Grainger format")
+            return parse_grainger_format(csv_file, csv_content)
+        elif all(keyword in header_line for keyword in ['upc', 'total retail price']) and 'category' in header_line:
+            logger.info("Detected liquidation format")
+            return parse_liquidation_format(csv_file, csv_content)
         elif any(keyword in header_line for keyword in ['item title', 'quantity', 'retail price', 'brand']):
             logger.info("Detected DirectLiquidation format")
             return parse_direct_liquidation_format(csv_file, csv_content)
@@ -331,28 +368,35 @@ def parse_staples_format(csv_file, csv_content):
         
         # Try different column name variations
         for key, value in row.items():
+            if not key:  # Skip if key is None or empty
+                continue
             key_lower = key.lower().strip()
-            if value and value.strip():
+            if value and str(value).strip():
+                value_str = str(value).strip()
                 if 'description' in key_lower:
-                    description = value.strip()
+                    description = value_str
                 elif 'model' in key_lower:
-                    model = value.strip()
+                    model = value_str
                 elif 'retail price' in key_lower and 'ext' not in key_lower:
                     try:
-                        # Remove commas and dollar signs
-                        msrp = float(re.sub(r'[^\d.]', '', str(value)))
+                        # Remove commas and dollar signs, handle empty strings
+                        cleaned = re.sub(r'[^\d.]', '', value_str)
+                        if cleaned:
+                            msrp = float(cleaned)
                     except (ValueError, TypeError):
                         msrp = None
                 elif 'quantity' in key_lower or 'qty' in key_lower:
                     try:
-                        quantity = int(value.strip())
+                        cleaned = re.sub(r'[^\d]', '', value_str)
+                        if cleaned:
+                            quantity = int(cleaned)
                     except (ValueError, TypeError):
                         quantity = None
                 elif 'sku restriction' in key_lower or 'restriction' in key_lower:
-                    sku_restriction = value.strip()
+                    sku_restriction = value_str
         
         # Only add items with essential data
-        if description and msrp:
+        if description and msrp and msrp > 0:
             notes_parts = []
             if model: notes_parts.append(f"Model: {model}")
             if sku_restriction: notes_parts.append(f"Restriction: {sku_restriction}")
@@ -387,16 +431,16 @@ def parse_direct_liquidation_format(csv_file, csv_content):
         for key, value in row.items():
             key_lower = key.lower().strip()
             if value and value.strip():
-                if 'item title' in key_lower or 'title' in key_lower:
+                if 'item title' in key_lower or 'title' in key_lower or 'product' in key_lower or 'description' in key_lower:
                     item_title = value.strip()
                 elif 'retail price' in key_lower or 'msrp' in key_lower:
                     try:
                         msrp = float(re.sub(r'[^\d.]', '', str(value)))
                     except (ValueError, TypeError):
                         msrp = None
-                elif 'upc' in key_lower:
+                elif 'upc' in key_lower or 'sku' in key_lower:
                     upc = value.strip()
-                elif 'brand' in key_lower:
+                elif 'brand' in key_lower or 'manufacturer' in key_lower:
                     brand = value.strip()
                 elif 'quantity' in key_lower or 'qty' in key_lower:
                     try:
@@ -1059,13 +1103,27 @@ def analyze_item_with_ai(item):
         # Search for product image
         image_data = find_product_image(item['title'], item.get('item_number'))
         
-        # Prepare the prompt for AI analysis
+        # Prepare enriched product data for prompt
+        enrichment_info = ""
+        if item.get('enriched'):
+            enrichment_info = f"""
+        === VERIFIED PRODUCT DATA (from {item.get('enrichment_source', 'external source')}) ===
+        Brand: {item.get('brand', 'Unknown')}
+        Model: {item.get('model', 'Unknown')}
+        Category: {item.get('category', 'Unknown')}
+        Condition: {item.get('condition', 'Unknown')}
+        MSRP Verified: {'Yes' if item.get('msrp_verified') else 'No'}
+        Current Amazon Price: ${item.get('current_market_price', 'N/A'):.2f if item.get('current_market_price') else 'N/A'}
+        Product Features: {', '.join(item.get('features', [])) if item.get('features') else 'N/A'}
+        """
+        
+        # Prepare the prompt for AI analysis with enriched data
         prompt = f"""
-        Analyze this industrial equipment item for liquidation pricing arbitrage:
+        Analyze this product for liquidation pricing arbitrage:
         
         Item: {item['title']}
         MSRP: ${item['msrp']:.2f}
-        Category: Industrial Equipment
+        {enrichment_info}
         
         Marketplace Data:
         - Amazon: {'Available' if marketplace_data['amazon']['available'] else 'Not found'} 
@@ -1073,21 +1131,17 @@ def analyze_item_with_ai(item):
         - eBay: {'Available' if marketplace_data['ebay']['available'] else 'Not found'}
           {'$' + str(marketplace_data['ebay']['price']) if marketplace_data['ebay']['price'] else 'N/A'}
         
-        This is being sold at liquidation prices (typically 15-50% of MSRP).
-        Consider:
-        - Liquidation market conditions (buyers expect deep discounts)
-        - Equipment condition (may be used, damaged, or overstock)
-        - Market demand for industrial equipment
-        - Competition from other liquidation sellers
-        - Storage and shipping costs
-        - Target buyer demographics (contractors, small businesses, hobbyists)
-        - Current marketplace prices for reference
+        CONTEXT:
+        - This is being sold at liquidation prices (typically 15-50% of MSRP)
+        - Product condition: {item.get('condition', 'Unknown')}
+        - Consider: market demand, competition, storage/shipping costs, target buyers
+        - Use verified Amazon price as market baseline if available
         
-        Please provide:
-        1. Estimated liquidation sale price (15-50% of MSRP)
+        ANALYSIS REQUIRED:
+        1. Estimated realistic resale price (considering condition and market)
         2. Market demand level (High/Medium/Low)
-        3. Estimated sales time (e.g., "2-4 weeks", "1-3 months", "3-6 months")
-        4. Brief reasoning for the pricing
+        3. Estimated sales time (e.g., "2-4 weeks", "1-3 months")
+        4. Brief reasoning
         
         Respond in JSON format:
         {{
@@ -1098,40 +1152,86 @@ def analyze_item_with_ai(item):
         }}
         """
         
-        # Try to call AI API first, fallback to mock if unavailable
-        try:
-            logger.info(f"Attempting AI analysis for item {item['item_number']}")
-            result = call_ai_api(prompt, item)
-            logger.info(f"AI analysis successful for item {item['item_number']}")
-            
-            # Add marketplace data and image to the result
-            result['marketplace'] = marketplace_data
-            result['image'] = image_data
-            return result
-        except Exception as ai_error:
-            logger.warning(f"AI API unavailable, using mock analysis: {str(ai_error)}")
-            mock_result = analyze_item_mock(item)
-            mock_result['marketplace'] = marketplace_data
-            mock_result['image'] = image_data
-            return mock_result
+        # Try to call AI API with retry logic for rate limits
+        import time
+        max_retries = 3
+        retry_delay = 2  # seconds
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                if attempt > 0:
+                    logger.info(f"Retry attempt {attempt + 1}/{max_retries} for item {item['item_number']}")
+                    time.sleep(retry_delay * attempt)  # Exponential backoff
+                
+                logger.info(f"Attempting AI analysis for item {item['item_number']}")
+                result = call_ai_api(prompt, item)
+                logger.info(f"AI analysis successful for item {item['item_number']}")
+                
+                # Add marketplace data and image to the result
+                result['marketplace'] = marketplace_data
+                result['image'] = image_data
+                return result
+                
+            except Exception as ai_error:
+                last_error = ai_error
+                error_str = str(ai_error)
+                # Check if it's a rate limit error
+                if '429' in error_str or 'rate_limit' in error_str.lower():
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Rate limit hit for item {item['item_number']}, retrying...")
+                        continue  # Retry
+                    else:
+                        logger.error(f"AI API failed after {max_retries} attempts for item {item['item_number']}: {error_str}")
+                else:
+                    # Not a rate limit error, don't retry
+                    logger.error(f"AI API failed for item {item['item_number']}: {error_str}")
+                    break
+        
+        # If we get here, all retries failed
+        return {
+            'estimatedSalePrice': 0,
+            'demand': 'Error',
+            'salesTime': 'N/A',
+            'reasoning': f'AI analysis failed: {str(last_error)[:100]}' if last_error else 'AI analysis failed',
+            'marketplace': marketplace_data,
+            'image': image_data,
+            'error': True
+        }
         
     except Exception as e:
-        logger.error(f"AI analysis error for item {item['item_number']}: {str(e)}")
-        mock_result = analyze_item_mock(item)
-        mock_result['marketplace'] = {'amazon': {'available': False, 'price': None}, 'ebay': {'available': False, 'price': None}}
-        # Try to get image even for error case
-        try:
-            image_data = find_product_image(item['title'], item.get('item_number'))
-            mock_result['image'] = image_data
-        except:
-            mock_result['image'] = None
-        return mock_result
+        logger.error(f"Analysis error for item {item['item_number']}: {str(e)}")
+        # Return error instead of mock data
+        return {
+            'estimatedSalePrice': 0,
+            'demand': 'Error',
+            'salesTime': 'N/A',
+            'reasoning': f'Analysis error: {str(e)[:100]}',
+            'marketplace': {'amazon': {'available': False, 'price': None}, 'ebay': {'available': False, 'price': None}},
+            'image': None,
+            'error': True
+        }
 
 def call_ai_api(prompt, item):
-    """Call external AI API for item analysis"""
-    api_key = os.environ.get('OPENAI_API_KEY')
-    if not api_key:
-        raise Exception("OpenAI API key not configured")
+    """Call external AI API for item analysis - using OpenAI (better rate limits)"""
+    # Get API keys from Secrets Manager or environment
+    api_keys = get_api_keys()
+    
+    openai_api_key = api_keys.get('OPENAI_API_KEY')
+    groq_api_key = api_keys.get('GROQ_API_KEY')
+    
+    if openai_api_key:
+        # Use OpenAI (better rate limits)
+        api_key = openai_api_key
+        api_url = 'https://api.openai.com/v1/chat/completions'
+        model = 'gpt-4o-mini'  # Cost-effective, fast
+    elif groq_api_key:
+        # Fallback to Groq
+        api_key = groq_api_key
+        api_url = 'https://api.groq.com/openai/v1/chat/completions'
+        model = 'llama-3.3-70b-versatile'
+    else:
+        raise Exception("No AI API key configured (OPENAI_API_KEY or GROQ_API_KEY)")
     
     headers = {
         'Authorization': f'Bearer {api_key}',
@@ -1139,7 +1239,7 @@ def call_ai_api(prompt, item):
     }
     
     data = {
-        'model': 'gpt-4',
+        'model': model,
         'messages': [
             {'role': 'system', 'content': 'You are an expert in retail arbitrage analysis for industrial equipment. Always respond with valid JSON format.'},
             {'role': 'user', 'content': prompt}
@@ -1149,8 +1249,7 @@ def call_ai_api(prompt, item):
     }
     
     try:
-        response = requests.post('https://api.openai.com/v1/chat/completions', 
-                               headers=headers, json=data, timeout=20)
+        response = requests.post(api_url, headers=headers, json=data, timeout=20)
         
         if response.status_code == 200:
             result = response.json()
@@ -1165,7 +1264,7 @@ def call_ai_api(prompt, item):
             
             return json.loads(content)
         else:
-            raise Exception(f"OpenAI API error: {response.status_code} - {response.text}")
+            raise Exception(f"AI API error: {response.status_code} - {response.text}")
     except json.JSONDecodeError as e:
         logger.error(f"JSON decode error: {str(e)}")
         raise Exception("Invalid JSON response from AI API")
@@ -1173,8 +1272,8 @@ def call_ai_api(prompt, item):
         logger.error(f"Request error: {str(e)}")
         raise Exception(f"AI API request failed: {str(e)}")
 
-def analyze_item_mock(item):
-    """Mock AI analysis based on item characteristics - liquidation pricing"""
+def analyze_item_mock(item, marketplace_data=None):
+    """Analysis based on marketplace data and item characteristics"""
     title = item['title'].lower()
     msrp = item['msrp']
     
@@ -1182,54 +1281,77 @@ def analyze_item_mock(item):
     if not msrp or msrp <= 0:
         msrp = 100.0  # Default fallback
     
-    # Base liquidation pricing: 30% of MSRP average
-    base_liquidation_price = msrp * 0.3
+    # Try to use real marketplace data first
+    estimated_sale_price = None
+    if marketplace_data:
+        amazon_price = marketplace_data.get('amazon', {}).get('price')
+        ebay_price = marketplace_data.get('ebay', {}).get('price')
+        
+        # Use marketplace prices if available
+        if amazon_price and ebay_price:
+            # Average of both marketplaces
+            estimated_sale_price = (amazon_price + ebay_price) / 2
+        elif amazon_price:
+            estimated_sale_price = amazon_price * 0.95  # Slightly lower than Amazon
+        elif ebay_price:
+            estimated_sale_price = ebay_price * 0.95  # Slightly lower than eBay
     
-    # Adjust based on item characteristics (liquidation market factors)
-    if any(keyword in title for keyword in ['compressor', 'vacuum', 'pressure washer', 'generator']):
-        # High-demand industrial equipment sells faster in liquidation
-        estimated_sale_price = msrp * 0.35
-        demand = 'High'
-        sales_time = '2-4 weeks'
-    elif any(keyword in title for keyword in ['motor', 'pump', 'fan', 'blower']):
-        # Motors and pumps have steady demand
-        estimated_sale_price = msrp * 0.32
-        demand = 'Medium'
-        sales_time = '1-3 months'
-    elif any(keyword in title for keyword in ['cabinet', 'storage', 'enclosure', 'box']):
-        # Storage items are slower moving
-        estimated_sale_price = msrp * 0.25
-        demand = 'Low'
-        sales_time = '3-6 months'
-    elif any(keyword in title for keyword in ['tool', 'drill', 'saw', 'grinder']):
-        # Power tools sell well in liquidation
-        estimated_sale_price = msrp * 0.40
-        demand = 'High'
-        sales_time = '1-2 weeks'
-    elif any(keyword in title for keyword in ['heater', 'cooler', 'air', 'ventilation']):
-        # HVAC equipment has seasonal demand
-        estimated_sale_price = msrp * 0.28
-        demand = 'Medium'
-        sales_time = '2-4 months'
-    elif any(keyword in title for keyword in ['tank', 'drum', 'container', 'barrel']):
-        # Large containers are harder to move
-        estimated_sale_price = msrp * 0.20
-        demand = 'Low'
-        sales_time = '4-8 months'
+    # If we have marketplace data, adjust demand and sales time
+    if estimated_sale_price:
+        # Determine demand based on price vs MSRP ratio
+        price_ratio = estimated_sale_price / msrp if msrp > 0 else 0.5
+        if price_ratio > 0.7:
+            demand = 'High'
+            sales_time = '1-2 weeks'
+        elif price_ratio > 0.4:
+            demand = 'Medium'
+            sales_time = '2-4 weeks'
+        else:
+            demand = 'Low'
+            sales_time = '1-3 months'
+        reasoning = f"Market-based pricing: ${estimated_sale_price:.2f} from marketplace data"
     else:
-        # Default liquidation pricing
-        estimated_sale_price = msrp * 0.30
-        demand = 'Medium'
-        sales_time = '2-3 months'
-    
-    # Add some randomness to make it more realistic (±10%)
-    import random
-    price_variation = random.uniform(0.9, 1.1)
-    estimated_sale_price *= price_variation
-    
-    # Ensure realistic liquidation bounds
-    estimated_sale_price = max(estimated_sale_price, msrp * 0.15)  # Never less than 15% of MSRP
-    estimated_sale_price = min(estimated_sale_price, msrp * 0.50)  # Never more than 50% of MSRP
+        # Fallback to characteristic-based estimation
+        # Adjust based on item characteristics (liquidation market factors)
+        if any(keyword in title for keyword in ['compressor', 'vacuum', 'pressure washer', 'generator']):
+            estimated_sale_price = msrp * 0.35
+            demand = 'High'
+            sales_time = '2-4 weeks'
+        elif any(keyword in title for keyword in ['motor', 'pump', 'fan', 'blower']):
+            estimated_sale_price = msrp * 0.32
+            demand = 'Medium'
+            sales_time = '1-3 months'
+        elif any(keyword in title for keyword in ['cabinet', 'storage', 'enclosure', 'box']):
+            estimated_sale_price = msrp * 0.25
+            demand = 'Low'
+            sales_time = '3-6 months'
+        elif any(keyword in title for keyword in ['tool', 'drill', 'saw', 'grinder']):
+            estimated_sale_price = msrp * 0.40
+            demand = 'High'
+            sales_time = '1-2 weeks'
+        elif any(keyword in title for keyword in ['heater', 'cooler', 'air', 'ventilation']):
+            estimated_sale_price = msrp * 0.28
+            demand = 'Medium'
+            sales_time = '2-4 months'
+        elif any(keyword in title for keyword in ['tank', 'drum', 'container', 'barrel']):
+            estimated_sale_price = msrp * 0.20
+            demand = 'Low'
+            sales_time = '4-8 months'
+        else:
+            estimated_sale_price = msrp * 0.30
+            demand = 'Medium'
+            sales_time = '2-3 months'
+        
+        # Add some randomness to make it more realistic (±10%)
+        import random
+        price_variation = random.uniform(0.9, 1.1)
+        estimated_sale_price *= price_variation
+        
+        # Ensure realistic liquidation bounds
+        estimated_sale_price = max(estimated_sale_price, msrp * 0.15)
+        estimated_sale_price = min(estimated_sale_price, msrp * 0.50)
+        
+        reasoning = f"Estimated pricing: {estimated_sale_price/msrp*100:.0f}% of MSRP with {demand.lower()} demand"
     
     # Calculate profit margin based on liquidation purchase price (33% of projected revenue)
     liquidation_purchase_price = estimated_sale_price * 0.33
@@ -1240,7 +1362,7 @@ def analyze_item_mock(item):
         'profitMargin': round(profit_margin, 3),
         'demand': demand,
         'salesTime': sales_time,
-        'reasoning': f"Liquidation pricing: {estimated_sale_price/msrp*100:.0f}% of MSRP with {demand.lower()} demand"
+        'reasoning': reasoning
     }
 
 def calculate_summary(items_with_analysis):
@@ -1288,24 +1410,50 @@ def calculate_summary(items_with_analysis):
     }
 
 def generate_charts(items_with_analysis):
-    """Generate chart data"""
-    # Revenue timeline (mock data for 12 months)
+    """Generate chart data based on actual sales time estimates"""
     months = ['Month 1', 'Month 2', 'Month 3', 'Month 4', 'Month 5', 'Month 6',
               'Month 7', 'Month 8', 'Month 9', 'Month 10', 'Month 11', 'Month 12']
     
-    # Simulate revenue distribution over time
-    total_revenue = sum(item['analysis']['estimatedSalePrice'] for item in items_with_analysis)
-    revenue_timeline = []
-    cumulative = 0
+    # Calculate revenue timeline based on actual sales time estimates
+    revenue_timeline = [0] * 12
     
-    for i in range(12):
-        if i < 6:  # First 6 months get 70% of revenue
-            monthly_revenue = total_revenue * 0.7 / 6
-        else:  # Last 6 months get 30% of revenue
-            monthly_revenue = total_revenue * 0.3 / 6
+    for item in items_with_analysis:
+        sales_time = item['analysis']['salesTime']
+        estimated_price = item['analysis']['estimatedSalePrice']
         
+        # Parse sales time to determine when items will sell
+        if 'week' in sales_time.lower():
+            weeks_match = re.findall(r'\d+', sales_time)
+            if weeks_match:
+                weeks = int(weeks_match[0])
+                # Convert weeks to months (round up)
+                month_index = min((weeks + 3) // 4, 11)  # Cap at month 12
+                revenue_timeline[month_index] += estimated_price
+        elif 'month' in sales_time.lower():
+            months_match = re.findall(r'\d+', sales_time)
+            if months_match:
+                months_str = months_match[0]
+                if '-' in sales_time:
+                    # Handle ranges like "1-3 months" - use average
+                    months_parts = re.findall(r'\d+', sales_time)
+                    if len(months_parts) >= 2:
+                        avg_months = (int(months_parts[0]) + int(months_parts[1])) // 2
+                        month_index = min(avg_months - 1, 11)
+                    else:
+                        month_index = min(int(months_str) - 1, 11)
+                else:
+                    month_index = min(int(months_str) - 1, 11)
+                revenue_timeline[month_index] += estimated_price
+        else:
+            # Default to month 6 if we can't parse
+            revenue_timeline[5] += estimated_price
+    
+    # Convert to cumulative revenue
+    cumulative_revenue = []
+    cumulative = 0
+    for monthly_revenue in revenue_timeline:
         cumulative += monthly_revenue
-        revenue_timeline.append(cumulative)
+        cumulative_revenue.append(cumulative)
     
     # Category breakdown
     categories = {}
@@ -1327,7 +1475,7 @@ def generate_charts(items_with_analysis):
     return {
         'revenueTimeline': {
             'labels': months,
-            'data': revenue_timeline
+            'data': cumulative_revenue
         },
         'categoryBreakdown': {
             'labels': list(categories.keys()),
@@ -1416,6 +1564,10 @@ def check_amazon_availability(item_title, item_number=None):
         credentials = get_paapi_credentials()
         if not credentials:
             return {'available': False, 'price': None, 'url': None}
+        
+        # Set cache directory to /tmp (only writable location in Lambda)
+        import tempfile
+        os.environ['AMAZON_PAAPI_CACHE_DIR'] = '/tmp'
         
         # Initialize Amazon API client
         amazon = AmazonApi(
@@ -1531,6 +1683,432 @@ def download_and_store_image(image_url, item_title, source):
 def create_thumbnail(image_data, size=(200, 200)):
     return None
 
+def insert_items_to_database(upload_id, manifest_id, items):
+    """Insert all items into database first before processing"""
+    inserted_ids = []
+    
+    try:
+        conn = get_db_connection()
+        if not conn:
+            logger.error("Database connection failed")
+            return []
+        
+        conn.autocommit = False  # Ensure we're in transaction mode
+        logger.info(f"Inserting {len(items)} items into database")
+        
+        for item in items:
+            try:
+                cursor = conn.cursor()
+                
+                # Generate item_number if missing
+                import hashlib
+                item_number = item.get('item_id') or item.get('item_number') or item.get('sku')
+                if not item_number:
+                    item_number = hashlib.md5(item.get('title', 'unknown').encode()).hexdigest()[:12]
+                
+                # Insert item with status='pending' or get existing id if duplicate
+                cursor.execute("""
+                    INSERT INTO items (
+                        manifest_id, item_number, title, msrp, quantity, status
+                    ) VALUES (%s, %s, %s, %s, %s, 'pending')
+                    ON CONFLICT (manifest_id, item_number) 
+                    DO UPDATE SET 
+                        status = 'pending',
+                        quantity = items.quantity + EXCLUDED.quantity
+                    RETURNING id
+                """, (
+                    manifest_id,
+                    item_number,
+                    item.get('title'),
+                    item.get('msrp'),
+                    item.get('quantity', 1)
+                ))
+                
+                item_id = cursor.fetchone()[0]
+                inserted_ids.append(item_id)
+                
+                # Commit each item individually
+                conn.commit()
+                cursor.close()
+                
+            except Exception as e:
+                logger.error(f"Failed to insert item {item.get('item_number', 'unknown')}: {str(e)}")
+                # Rollback this item and continue
+                try:
+                    conn.rollback()
+                except:
+                    pass
+                continue
+        
+        conn.close()
+        
+        logger.info(f"Successfully inserted {len(inserted_ids)}/{len(items)} items")
+        return inserted_ids
+        
+    except Exception as e:
+        logger.error(f"Error inserting items: {str(e)}")
+        return []
+
+def queue_items_for_processing(upload_id, item_ids):
+    """Queue item IDs to SQS for async processing"""
+    try:
+        queue_url = os.environ.get('SQS_QUEUE_URL')
+        if not queue_url:
+            logger.error("SQS_QUEUE_URL not set in environment")
+            return False
+        
+        logger.info(f"Queueing {len(item_ids)} item IDs to SQS for upload {upload_id}")
+        
+        # Send item IDs in batches of 10 (SQS limit)
+        batch_size = 10
+        total_queued = 0
+        
+        for i in range(0, len(item_ids), batch_size):
+            batch = item_ids[i:i + batch_size]
+            entries = []
+            
+            for j, item_id in enumerate(batch):
+                index = i + j
+                message = {
+                    'upload_id': upload_id,
+                    'item_id': item_id,
+                    'item_index': index,
+                    'total_items': len(item_ids)
+                }
+                
+                entries.append({
+                    'Id': str(index),
+                    'MessageBody': json.dumps(message, default=str)
+                })
+            
+            try:
+                response = sqs_client.send_message_batch(
+                    QueueUrl=queue_url,
+                    Entries=entries
+                )
+                
+                # Check for failed messages
+                if 'Failed' in response and response['Failed']:
+                    for failed in response['Failed']:
+                        logger.error(f"Failed to queue item {failed['Id']}: {failed['Message']}")
+                
+                total_queued += len(response.get('Successful', []))
+                
+            except Exception as e:
+                logger.error(f"Failed to queue batch starting at {i}: {str(e)}")
+                # Continue with other batches
+                
+        logger.info(f"Successfully queued {total_queued}/{len(item_ids)} item IDs for processing")
+        return total_queued > 0
+        
+    except Exception as e:
+        logger.error(f"Error queueing items: {str(e)}")
+        return False
+
+def create_upload_record(filename, file_hash, total_items, upload_name=None):
+    """Create upload record in database and return upload_id"""
+    try:
+        conn = get_db_connection()
+        if not conn:
+            logger.error("Database connection failed")
+            return None
+            
+        cursor = conn.cursor()
+        upload_id = str(uuid.uuid4())
+        manifest_id = str(uuid.uuid4())
+        
+        # Generate upload name with timestamp if not provided (in Eastern time)
+        from datetime import timezone, timedelta
+        # Eastern time: UTC-5 (EST) or UTC-4 (EDT)
+        # Using UTC-4 as a reasonable default for most of the year
+        eastern = timezone(timedelta(hours=-4))
+        now_eastern = datetime.now(eastern)
+        
+        if not upload_name:
+            upload_name = f"Upload {now_eastern.strftime('%Y-%m-%d %I:%M:%S %p')}"
+        else:
+            # Append timestamp to user's name to ensure uniqueness
+            upload_name = f"{upload_name} - {now_eastern.strftime('%Y-%m-%d %I:%M:%S %p')}"
+        
+        # Create upload record first (since manifest has FK to upload)
+        cursor.execute("""
+            INSERT INTO uploads (id, filename, file_hash, manifest_id, status, processed_items, upload_name, s3_key)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+        """, (upload_id, filename, file_hash, manifest_id, 'processing', 0, upload_name, file_hash))
+        
+        # Create manifest record
+        cursor.execute("""
+            INSERT INTO manifests (id, upload_id, total_items, total_msrp, projected_revenue, profit_margin)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            RETURNING id
+        """, (manifest_id, upload_id, total_items, 0, 0, 0))
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        logger.info(f"Created upload record: {upload_id} with name: {upload_name}")
+        return upload_id
+        
+    except Exception as e:
+        logger.error(f"Error creating upload record: {str(e)}")
+        return None
+
+def calculate_80_percent_sellout_time(items_with_sales_time):
+    """Calculate estimated time for 80% of items to sell"""
+    if not items_with_sales_time:
+        return None
+    
+    # Parse sales time to days and sort by time
+    item_days = []
+    for item in items_with_sales_time:
+        sales_time = item['sales_time']
+        quantity = item['quantity']
+        
+        # Parse common formats: "1-3 months", "2-4 weeks", "1-2 weeks", etc.
+        if not sales_time or sales_time == 'N/A':
+            continue
+        
+        # Ensure sales_time is a string
+        sales_time = str(sales_time)
+            
+        days = 0
+        if 'month' in sales_time.lower():
+            # Extract numbers and take the max (conservative estimate)
+            import re
+            numbers = re.findall(r'\d+', sales_time)
+            if numbers:
+                max_months = max([int(n) for n in numbers])
+                days = max_months * 30
+        elif 'week' in sales_time.lower():
+            import re
+            numbers = re.findall(r'\d+', sales_time)
+            if numbers:
+                max_weeks = max([int(n) for n in numbers])
+                days = max_weeks * 7
+        elif 'day' in sales_time.lower():
+            import re
+            numbers = re.findall(r'\d+', sales_time)
+            if numbers:
+                days = max([int(n) for n in numbers])
+        
+        if days > 0:
+            # Add multiple entries for quantity
+            for _ in range(quantity):
+                item_days.append(days)
+    
+    if not item_days:
+        return None
+    
+    # Sort and get 80th percentile
+    item_days.sort()
+    percentile_80_index = int(len(item_days) * 0.8)
+    days_80 = item_days[percentile_80_index] if percentile_80_index < len(item_days) else item_days[-1]
+    
+    # Format as human-readable
+    if days_80 < 14:
+        return f"{days_80} days"
+    elif days_80 < 60:
+        weeks = days_80 // 7
+        return f"{weeks} weeks"
+    else:
+        months = days_80 // 30
+        return f"{months} months"
+
+def get_upload_status(upload_id):
+    """Get upload status and results"""
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return None
+            
+        cursor = conn.cursor()
+        
+        # Get upload and manifest data
+        cursor.execute("""
+            SELECT u.status, u.processed_items, u.error_message, u.filename, u.upload_name,
+                   m.id as manifest_id, m.total_items, m.total_msrp, 
+                   m.projected_revenue, m.profit_margin
+            FROM uploads u
+            LEFT JOIN manifests m ON u.manifest_id = m.id
+            WHERE u.id = %s
+        """, (upload_id,))
+        
+        result = cursor.fetchone()
+        if not result:
+            cursor.close()
+            conn.close()
+            return None
+        
+        status, processed_items, error_message, filename, upload_name, manifest_id, total_items, \
+            total_msrp, projected_revenue, profit_margin = result
+        
+        response = {
+            'upload_id': upload_id,
+            'upload_name': upload_name,
+            'status': status,
+            'processed_items': processed_items,
+            'total_items': total_items,
+            'filename': filename
+        }
+        
+        # Include partial summary for processing uploads
+        if status == 'processing':
+            # Calculate current progress from processed items
+            cursor.execute("""
+                SELECT 
+                    COUNT(*) as processed_count,
+                    COALESCE(SUM(msrp * quantity), 0) as total_msrp,
+                    COALESCE(SUM(estimated_sale_price * quantity), 0) as projected_revenue,
+                    COALESCE(AVG(CASE WHEN estimated_sale_price > 0 THEN profit / (estimated_sale_price * quantity) END), 0) as avg_profit_margin
+                FROM items
+                WHERE manifest_id = %s
+                AND estimated_sale_price IS NOT NULL
+            """, (manifest_id,))
+            
+            progress_result = cursor.fetchone()
+            if progress_result:
+                processed_count, total_msrp, projected_revenue, avg_profit_margin = progress_result
+                response['summary'] = {
+                    'totalMSRP': float(total_msrp) if total_msrp else 0,
+                    'projectedRevenue': float(projected_revenue) if projected_revenue else 0,
+                    'profitMargin': float(avg_profit_margin) if avg_profit_margin else 0,
+                    'partial': True  # Indicate this is partial data
+                }
+        
+        # If completed, include results
+        if status == 'completed':
+            # Get items
+            cursor.execute("""
+                SELECT item_number, title, msrp, quantity,
+                       estimated_sale_price, profit, demand, sales_time, reasoning
+                FROM items
+                WHERE manifest_id = %s
+                ORDER BY created_at
+            """, (manifest_id,))
+            
+            items = []
+            for row in cursor.fetchall():
+                item_number, title, msrp, quantity, est_price, profit, demand, sales_time, reasoning = row
+                items.append({
+                    'item_number': item_number,
+                    'title': title,
+                    'msrp': float(msrp) if msrp else 0,
+                    'quantity': quantity,
+                    'analysis': {
+                        'estimatedSalePrice': float(est_price) if est_price else 0,
+                        'demand': demand,
+                        'salesTime': sales_time,
+                        'reasoning': reasoning,
+                        'marketplace': {
+                            'amazon': {'available': False, 'price': None},
+                            'ebay': {'available': False, 'price': None}
+                        }
+                    },
+                    'profit': float(profit) if profit else 0
+                })
+            
+            response['items'] = items
+            
+            # Calculate 80% sellout time
+            cursor.execute("""
+                SELECT sales_time, quantity
+                FROM items
+                WHERE manifest_id = %s
+                AND sales_time IS NOT NULL
+            """, (manifest_id,))
+            
+            items_for_sellout = [{'sales_time': row[0], 'quantity': row[1]} for row in cursor.fetchall()]
+            sellout_80_time = calculate_80_percent_sellout_time(items_for_sellout)
+            
+            response['summary'] = {
+                'totalItems': total_items,
+                'totalMSRP': float(total_msrp) if total_msrp else 0,
+                'projectedRevenue': float(projected_revenue) if projected_revenue else 0,
+                'profitMargin': float(profit_margin) if profit_margin else 0,
+                'avgSalesTime': sellout_80_time
+            }
+            
+            # Generate charts for completed uploads
+            response['charts'] = generate_charts(items)
+        
+        if error_message:
+            response['error_message'] = error_message
+        
+        cursor.close()
+        conn.close()
+        
+        return response
+        
+    except Exception as e:
+        logger.error(f"Error getting upload status: {str(e)}")
+        return None
+
+def get_upload_history(limit=50):
+    """Get list of recent uploads"""
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return []
+            
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT u.id, u.upload_name, u.filename, u.status, 
+                   u.created_at, m.total_items, u.processed_items
+            FROM uploads u
+            LEFT JOIN manifests m ON u.manifest_id = m.id
+            ORDER BY u.created_at DESC
+            LIMIT %s
+        """, (limit,))
+        
+        uploads = []
+        for row in cursor.fetchall():
+            upload_id, upload_name, filename, status, created_at, total_items, processed_items = row
+            uploads.append({
+                'upload_id': upload_id,
+                'upload_name': upload_name,
+                'filename': filename,
+                'status': status,
+                'created_at': created_at.isoformat() if created_at else None,
+                'total_items': total_items,
+                'processed_items': processed_items
+            })
+        
+        cursor.close()
+        conn.close()
+        
+        return uploads
+        
+    except Exception as e:
+        logger.error(f"Error getting upload history: {str(e)}")
+        return []
+
+def delete_upload(upload_id):
+    """Delete an upload and all associated data"""
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return False
+            
+        cursor = conn.cursor()
+        
+        # Delete upload (cascade will delete manifest and items)
+        cursor.execute("DELETE FROM uploads WHERE id = %s", (upload_id,))
+        deleted_count = cursor.rowcount
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        logger.info(f"Deleted upload {upload_id}, rows affected: {deleted_count}")
+        return deleted_count > 0
+        
+    except Exception as e:
+        logger.error(f"Error deleting upload: {str(e)}")
+        return False
+
 def lambda_handler(event, context):
     """Main Lambda handler"""
     
@@ -1558,6 +2136,78 @@ def lambda_handler(event, context):
         DB_CONFIG['user'] = os.environ['DB_USER']
         DB_CONFIG['password'] = os.environ['DB_PASSWORD']
         
+        # Check if this is a status check request (GET /status/{upload_id})
+        http_method = event.get('httpMethod', 'POST')
+        path = event.get('path', '')
+        
+        # Handle GET requests (history and status) - no body parsing needed
+        if http_method == 'GET':
+            if '/history' in path:
+                # Get upload history
+                logger.info("Fetching upload history")
+                history = get_upload_history()
+                
+                return {
+                    'statusCode': 200,
+                    'headers': cors_headers,
+                    'body': json.dumps({'uploads': history}, default=str)
+                }
+            
+            elif '/status/' in path:
+                # Extract upload_id from path
+                upload_id = event.get('pathParameters', {}).get('upload_id')
+                if not upload_id:
+                    return {
+                        'statusCode': 400,
+                        'headers': cors_headers,
+                        'body': json.dumps({'error': 'Missing upload_id'})
+                    }
+                
+                logger.info(f"Status check for upload {upload_id}")
+                status_data = get_upload_status(upload_id)
+                
+                if not status_data:
+                    return {
+                        'statusCode': 404,
+                        'headers': cors_headers,
+                        'body': json.dumps({'error': 'Upload not found'})
+                    }
+                
+                return {
+                    'statusCode': 200,
+                    'headers': cors_headers,
+                    'body': json.dumps(status_data, default=str)
+                }
+        
+        # Handle DELETE requests
+        elif http_method == 'DELETE':
+            if '/upload/' in path:
+                # Extract upload_id from path
+                upload_id = event.get('pathParameters', {}).get('upload_id')
+                if not upload_id:
+                    return {
+                        'statusCode': 400,
+                        'headers': cors_headers,
+                        'body': json.dumps({'error': 'Missing upload_id'})
+                    }
+                
+                logger.info(f"Deleting upload {upload_id}")
+                success = delete_upload(upload_id)
+                
+                if success:
+                    return {
+                        'statusCode': 200,
+                        'headers': cors_headers,
+                        'body': json.dumps({'message': 'Upload deleted successfully'})
+                    }
+                else:
+                    return {
+                        'statusCode': 404,
+                        'headers': cors_headers,
+                        'body': json.dumps({'error': 'Upload not found or could not be deleted'})
+                    }
+        
+        # Handle file upload (POST /upload)
         # Parse the request body
         if 'body' in event:
             # Handle API Gateway event
@@ -1571,6 +2221,7 @@ def lambda_handler(event, context):
                 body_data = json.loads(body)
                 file_content = body_data.get('file', '')
                 filename = body_data.get('filename', 'unknown.csv')
+                upload_name = body_data.get('upload_name', '')
             except json.JSONDecodeError:
                 return {
                     'statusCode': 400,
@@ -1592,6 +2243,15 @@ def lambda_handler(event, context):
         # Parse CSV
         items = parse_manifest_csv(file_content)
         logger.info(f"Parsed {len(items)} items from CSV")
+        
+        # Enrich and normalize data
+        logger.info(f"Starting data enrichment for {len(items)} items")
+        from data_enrichment import enrich_batch
+        enriched_items = enrich_batch(items, max_workers=10)
+        logger.info(f"Enrichment complete: {sum(1 for i in enriched_items if i.get('enriched'))} items successfully enriched")
+        
+        # Use enriched items for further processing
+        items = enriched_items
         
         if not items:
             return {
@@ -1615,65 +2275,75 @@ def lambda_handler(event, context):
                 'body': json.dumps(existing_analysis)
             }
         
-        logger.info(f"No existing analysis found, processing {len(items)} items")
+        logger.info(f"No existing analysis found, queueing {len(items)} items for async processing")
         
-        # Analyze items with eBay data first, then AI/mock fallback
-        items_with_analysis = []
-        items_to_process = items[:2]  # Process only first 2 items with AI to stay under API Gateway timeout
+        # Create upload record in database
+        upload_id = create_upload_record(filename, file_hash, len(items), upload_name)
         
-        logger.info(f"Processing {len(items_to_process)} items with AI analysis out of {len(items)} total items")
+        if not upload_id:
+            return {
+                'statusCode': 500,
+                'headers': cors_headers,
+                'body': json.dumps({'error': 'Failed to create upload record'})
+            }
         
-        for item in items_to_process:
-            analysis = analyze_item_with_ebay_data(item)
-            # Calculate profit based on liquidation purchase price (33% of sale price)
-            liquidation_purchase_price = analysis['estimatedSalePrice'] * 0.33
-            profit = analysis['estimatedSalePrice'] - liquidation_purchase_price
-            items_with_analysis.append({
-                **item,
-                'analysis': analysis,
-                'profit': profit
-            })
+        # Get manifest_id for this upload
+        conn = get_db_connection()
+        if not conn:
+            return {
+                'statusCode': 500,
+                'headers': cors_headers,
+                'body': json.dumps({'error': 'Database connection failed'})
+            }
+        cursor = conn.cursor()
+        cursor.execute("SELECT manifest_id FROM uploads WHERE id = %s", (upload_id,))
+        result = cursor.fetchone()
+        cursor.close()
+        conn.close()
         
-        # Add remaining items with mock analysis
-        remaining_items = items[2:]
-        logger.info(f"Processing {len(remaining_items)} remaining items with mock analysis")
+        if not result:
+            return {
+                'statusCode': 500,
+                'headers': cors_headers,
+                'body': json.dumps({'error': 'Failed to get manifest_id'})
+            }
         
-        for item in remaining_items:
-            analysis = analyze_item_mock(item)
-            # Calculate profit based on liquidation purchase price (33% of sale price)
-            liquidation_purchase_price = analysis['estimatedSalePrice'] * 0.33
-            profit = analysis['estimatedSalePrice'] - liquidation_purchase_price
-            items_with_analysis.append({
-                **item,
-                'analysis': analysis,
-                'profit': profit
-            })
+        manifest_id = result[0]
         
-        # Calculate summary
-        summary = calculate_summary(items_with_analysis)
+        # STEP 1: Insert all items into database first
+        item_ids = insert_items_to_database(upload_id, manifest_id, items)
         
-        # Generate charts
-        charts = generate_charts(items_with_analysis)
+        if not item_ids:
+            return {
+                'statusCode': 500,
+                'headers': cors_headers,
+                'body': json.dumps({'error': 'Failed to insert items to database'})
+            }
         
-        # Save to database (temporarily disabled for testing)
-        manifest_id = f"manifest_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        # save_analysis_to_db(manifest_id, items_with_analysis, summary, charts, file_hash, filename)
+        logger.info(f"Inserted {len(item_ids)} items into database")
         
-        logger.info(f"Processed {len(items_with_analysis)} items successfully")
+        # STEP 2: Queue item IDs for async processing
+        queue_success = queue_items_for_processing(upload_id, item_ids)
         
-        # Prepare response
-        response_data = {
-            'manifestId': manifest_id,
-            'summary': summary,
-            'items': items_with_analysis,
-            'charts': charts,
-            'processedAt': datetime.now().isoformat()
-        }
+        if not queue_success:
+            return {
+                'statusCode': 500,
+                'headers': cors_headers,
+                'body': json.dumps({'error': 'Failed to queue items for processing'})
+            }
         
+        logger.info(f"Successfully queued {len(item_ids)} item IDs for processing")
+        
+        # Return upload_id immediately for status polling
         return {
-            'statusCode': 200,
+            'statusCode': 202,  # 202 Accepted (async processing)
             'headers': cors_headers,
-            'body': json.dumps(response_data, default=str)
+            'body': json.dumps({
+                'upload_id': upload_id,
+                'status': 'processing',
+                'total_items': len(items),
+                'message': 'Upload accepted. Items are being processed asynchronously.'
+            })
         }
         
     except Exception as e:

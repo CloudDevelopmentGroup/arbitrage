@@ -4,12 +4,16 @@ import {
     ArrowUpTrayIcon as UploadIcon,
     DocumentIcon,
     ChartBarIcon,
-    CurrencyDollarIcon
+    CurrencyDollarIcon,
+    ClockIcon,
+    MagnifyingGlassIcon
 } from '@heroicons/react/24/outline';
 import toast, { Toaster } from 'react-hot-toast';
 import axios from 'axios';
 import AnalysisResults from './components/AnalysisResults';
 import LoadingSpinner from './components/LoadingSpinner';
+import UploadHistory from './components/UploadHistory';
+import SingleItemChecker from './components/SingleItemChecker';
 
 const API_BASE_URL = process.env.REACT_APP_API_URL || 'https://1biv76cy0j.execute-api.us-east-1.amazonaws.com';
 
@@ -20,6 +24,62 @@ function App() {
     const [isAnalyzing, setIsAnalyzing] = useState(false);
     const [uploadProgress, setUploadProgress] = useState(0);
     const [uploadMethod, setUploadMethod] = useState('file'); // 'file' or 'text'
+    const [processingStatus, setProcessingStatus] = useState(null); // {processed: 0, total: 0}
+    const [uploadId, setUploadId] = useState(null);
+    const [uploadName, setUploadName] = useState('');
+    const [uploadHistory, setUploadHistory] = useState([]);
+    const [showHistory, setShowHistory] = useState(false);
+    const [mode, setMode] = useState('manifest'); // 'manifest' or 'single-item'
+
+    // Fetch upload history on component mount
+    React.useEffect(() => {
+        fetchUploadHistory();
+    }, []);
+
+    const fetchUploadHistory = async () => {
+        try {
+            const response = await axios.get(`${API_BASE_URL}/prod/history`);
+            setUploadHistory(response.data.uploads || []);
+        } catch (error) {
+            console.error('Error fetching history:', error);
+        }
+    };
+
+    const handleSelectUpload = async (uploadId) => {
+        try {
+            setIsAnalyzing(true);
+            const response = await axios.get(`${API_BASE_URL}/prod/status/${uploadId}`);
+            setAnalysisResults(response.data);
+            setShowHistory(false);
+            toast.success('Analysis loaded!');
+        } catch (error) {
+            console.error('Error loading upload:', error);
+            toast.error('Failed to load analysis');
+        } finally {
+            setIsAnalyzing(false);
+        }
+    };
+
+    const handleDeleteUpload = async (uploadId) => {
+        try {
+            await axios.delete(`${API_BASE_URL}/prod/upload/${uploadId}`);
+            toast.success('Upload deleted successfully!');
+
+            // If the deleted upload is currently being viewed/processed, clear it
+            if (analysisResults && analysisResults.upload_id === uploadId) {
+                setAnalysisResults(null);
+                setIsAnalyzing(false);
+                setProcessingStatus(null);
+                setShowHistory(true);  // Show history instead
+            }
+
+            // Refresh history
+            await fetchUploadHistory();
+        } catch (error) {
+            console.error('Error deleting upload:', error);
+            toast.error('Failed to delete upload');
+        }
+    };
 
     const onDrop = useCallback((acceptedFiles) => {
         const file = acceptedFiles[0];
@@ -38,6 +98,62 @@ function App() {
         },
         multiple: false
     });
+
+    const pollStatus = async (uploadId) => {
+        try {
+            const response = await axios.get(`${API_BASE_URL}/prod/status/${uploadId}`);
+            const data = response.data;
+
+            setProcessingStatus({
+                processed: data.processed_items || 0,
+                total: data.total_items || 0
+            });
+
+            // Show partial results while processing
+            if (data.status === 'processing' && data.summary) {
+                setAnalysisResults({
+                    ...data,
+                    items: [], // No items yet, just summary
+                    summary: {
+                        ...data.summary,
+                        totalItems: data.total_items,
+                        processedItems: data.processed_items,
+                        partial: true
+                    }
+                });
+            }
+
+            if (data.status === 'completed') {
+                // Processing complete, show full results
+                setAnalysisResults(data);
+                setIsAnalyzing(false);
+                setProcessingStatus(null);
+                toast.success('Analysis completed successfully!');
+                return true; // Stop polling
+            } else if (data.status === 'failed') {
+                setIsAnalyzing(false);
+                setProcessingStatus(null);
+                toast.error(data.error_message || 'Processing failed');
+                return true; // Stop polling
+            }
+
+            return false; // Continue polling
+        } catch (error) {
+            console.error('Status check error:', error);
+
+            // If upload was deleted (404), stop polling and clear UI
+            if (error.response && error.response.status === 404) {
+                setIsAnalyzing(false);
+                setProcessingStatus(null);
+                setAnalysisResults(null);
+                setShowHistory(true);
+                toast.error('Upload was deleted');
+                return true; // Stop polling
+            }
+
+            return false; // Continue polling
+        }
+    };
 
     const handleAnalysis = async () => {
         let fileContent = '';
@@ -61,11 +177,14 @@ function App() {
 
         setIsAnalyzing(true);
         setUploadProgress(0);
+        setProcessingStatus(null);
 
         try {
+            // Upload file and get upload_id
             const response = await axios.post(`${API_BASE_URL}/prod/upload`, {
                 file: fileContent,
-                filename: filename
+                filename: filename,
+                upload_name: uploadName.trim() || null
             }, {
                 headers: {
                     'Content-Type': 'application/json',
@@ -76,14 +195,35 @@ function App() {
                 },
             });
 
-            setAnalysisResults(response.data);
-            toast.success('Analysis completed successfully!');
+            if (response.status === 202) {
+                // Async processing started
+                const { upload_id, total_items } = response.data;
+                setUploadId(upload_id);
+                setProcessingStatus({ processed: 0, total: total_items });
+                toast.success(`Processing ${total_items} items...`);
+
+                // Start polling for status
+                const pollInterval = setInterval(async () => {
+                    const isDone = await pollStatus(upload_id);
+                    if (isDone) {
+                        clearInterval(pollInterval);
+                    }
+                }, 2000); // Poll every 2 seconds
+
+                // Cleanup on unmount
+                return () => clearInterval(pollInterval);
+            } else {
+                // Old sync response (fallback)
+                setAnalysisResults(response.data);
+                setIsAnalyzing(false);
+                toast.success('Analysis completed successfully!');
+            }
         } catch (error) {
             console.error('Analysis error:', error);
             toast.error('Failed to analyze CSV. Please try again.');
-        } finally {
             setIsAnalyzing(false);
             setUploadProgress(0);
+            setProcessingStatus(null);
         }
     };
 
@@ -102,6 +242,8 @@ function App() {
         setAnalysisResults(null);
         setIsAnalyzing(false);
         setUploadProgress(0);
+        setUploadName('');
+        fetchUploadHistory(); // Refresh history after completing analysis
     };
 
     return (
@@ -116,8 +258,29 @@ function App() {
                             <ChartBarIcon className="h-8 w-8 text-blue-600 mr-3" />
                             <h1 className="text-2xl font-bold text-gray-900">Arbitrage Analyzer</h1>
                         </div>
-                        <div className="text-sm text-gray-500">
-                            AI-Powered Retail Arbitrage Analysis
+                        <div className="flex items-center space-x-4">
+                            {mode === 'manifest' && (
+                                <button
+                                    onClick={() => setMode('single-item')}
+                                    className="inline-flex items-center px-4 py-2 border border-blue-600 rounded-md shadow-sm text-sm font-medium text-blue-600 bg-white hover:bg-blue-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
+                                >
+                                    <MagnifyingGlassIcon className="h-5 w-5 mr-2" />
+                                    Check Single Item
+                                </button>
+                            )}
+                            <button
+                                onClick={() => {
+                                    setShowHistory(!showHistory);
+                                    if (!showHistory) fetchUploadHistory();
+                                }}
+                                className="inline-flex items-center px-4 py-2 border border-gray-300 rounded-md shadow-sm text-sm font-medium text-gray-700 bg-white hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
+                            >
+                                <ClockIcon className="h-5 w-5 mr-2 text-gray-500" />
+                                {showHistory ? 'Hide History' : 'View History'}
+                            </button>
+                            <div className="text-sm text-gray-500">
+                                AI-Powered Retail Arbitrage Analysis
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -125,8 +288,52 @@ function App() {
 
             {/* Main Content */}
             <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-                {!analysisResults ? (
+                {showHistory ? (
+                    <div className="space-y-6">
+                        <UploadHistory
+                            uploads={uploadHistory}
+                            onSelectUpload={handleSelectUpload}
+                            onDeleteUpload={handleDeleteUpload}
+                        />
+                        <div className="text-center">
+                            <button
+                                onClick={() => setShowHistory(false)}
+                                className="text-blue-600 hover:text-blue-700 text-sm font-medium"
+                            >
+                                ← Back to Upload
+                            </button>
+                        </div>
+                    </div>
+                ) : mode === 'single-item' ? (
+                    <SingleItemChecker 
+                        onBackToUpload={() => setMode('manifest')}
+                    />
+                ) : !analysisResults ? (
                     <div className="space-y-8">
+                        {/* Upload Name Input */}
+                        <div className="bg-white rounded-lg shadow-sm p-6">
+                            <h2 className="text-lg font-semibold text-gray-900 mb-4">
+                                Name Your Analysis
+                            </h2>
+                            <div>
+                                <label htmlFor="upload-name" className="block text-sm font-medium text-gray-700 mb-2">
+                                    Give this upload a memorable name (optional)
+                                </label>
+                                <input
+                                    type="text"
+                                    id="upload-name"
+                                    value={uploadName}
+                                    onChange={(e) => setUploadName(e.target.value)}
+                                    placeholder="e.g., Staples Manifest Jan 2025, Wayfair Pallet #123"
+                                    className="w-full px-4 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                                    maxLength={100}
+                                />
+                                <p className="mt-2 text-xs text-gray-500">
+                                    A timestamp will be automatically appended to ensure uniqueness
+                                </p>
+                            </div>
+                        </div>
+
                         {/* Upload Method Selection */}
                         <div className="bg-white rounded-lg shadow-sm p-6">
                             <h2 className="text-lg font-semibold text-gray-900 mb-4">
@@ -247,11 +454,22 @@ function App() {
                                     <div className="bg-gray-200 rounded-full h-2">
                                         <div
                                             className="bg-blue-600 h-2 rounded-full transition-all duration-300"
-                                            style={{ width: `${uploadProgress}%` }}
+                                            style={{
+                                                width: processingStatus
+                                                    ? `${Math.round((processingStatus.processed / processingStatus.total) * 100)}%`
+                                                    : `${uploadProgress}%`
+                                            }}
                                         ></div>
                                     </div>
                                     <p className="text-sm text-gray-600 mt-2">
-                                        Processing your manifest... This may take a few moments.
+                                        {processingStatus ? (
+                                            <>
+                                                Processing items: {processingStatus.processed} / {processingStatus.total}
+                                                {' '}({Math.round((processingStatus.processed / processingStatus.total) * 100)}%)
+                                            </>
+                                        ) : (
+                                            `Uploading... ${uploadProgress}%`
+                                        )}
                                     </p>
                                 </div>
                             )}

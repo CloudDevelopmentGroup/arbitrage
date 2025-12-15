@@ -8,7 +8,8 @@ import {
     ArrowTrendingDownIcon as TrendingDownIcon,
     MinusIcon,
     ChevronUpIcon,
-    ChevronDownIcon
+    ChevronDownIcon,
+    ClipboardDocumentIcon
 } from '@heroicons/react/24/outline';
 import { Line, Bar } from 'react-chartjs-2';
 import {
@@ -41,8 +42,6 @@ const AnalysisResults = ({ results, onReset, fileName }) => {
     const [sortField, setSortField] = useState('profit');
     const [sortDirection, setSortDirection] = useState('desc');
 
-    // Image modal state
-    const [imageModal, setImageModal] = useState({ isOpen: false, imageUrl: '', title: '' });
 
     // Sort items based on current sort settings
     const sortedItems = useMemo(() => {
@@ -106,13 +105,6 @@ const AnalysisResults = ({ results, onReset, fileName }) => {
         }
     };
 
-    const openImageModal = (imageUrl, title) => {
-        setImageModal({ isOpen: true, imageUrl, title });
-    };
-
-    const closeImageModal = () => {
-        setImageModal({ isOpen: false, imageUrl: '', title: '' });
-    };
 
     // Get sort icon for column headers
     const getSortIcon = (field) => {
@@ -145,6 +137,23 @@ const AnalysisResults = ({ results, onReset, fileName }) => {
 
     const formatPercentage = (value) => {
         return `${(value * 100).toFixed(1)}%`;
+    };
+
+    // Function to truncate text to about 50% of original length
+    const truncateText = (text, maxLength = 50) => {
+        if (!text) return '';
+        if (text.length <= maxLength) return text;
+        return text.substring(0, maxLength) + '...';
+    };
+
+    // Function to copy text to clipboard
+    const copyToClipboard = async (text) => {
+        try {
+            await navigator.clipboard.writeText(text);
+            // You could add a toast notification here if desired
+        } catch (err) {
+            console.error('Failed to copy text: ', err);
+        }
     };
 
     // Chart data
@@ -203,6 +212,31 @@ const AnalysisResults = ({ results, onReset, fileName }) => {
                 </button>
             </div>
 
+            {/* Items Processed Counter */}
+            <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 mb-6">
+                <div className="flex items-center justify-between">
+                    <div className="flex items-center space-x-3">
+                        <div className="flex-shrink-0">
+                            <ChartBarIcon className="h-6 w-6 text-blue-600" />
+                        </div>
+                        <div>
+                            <p className="text-sm font-medium text-blue-900">
+                                Items Analyzed: <span className="text-lg font-bold">{summary?.processedItems || items?.length || 0}</span> / <span className="text-lg font-bold">{summary?.totalItems || 0}</span>
+                            </p>
+                            {summary?.partial && (
+                                <p className="text-xs text-blue-700 mt-1">Processing in progress - values updating in real-time</p>
+                            )}
+                        </div>
+                    </div>
+                    <div className="text-right">
+                        <p className="text-2xl font-bold text-blue-600">
+                            {summary?.totalItems > 0 ? Math.round((summary?.processedItems || items?.length || 0) / summary.totalItems * 100) : 0}%
+                        </p>
+                        <p className="text-xs text-blue-700">Complete</p>
+                    </div>
+                </div>
+            </div>
+
             {/* Summary Cards */}
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
                 <div className="bg-white rounded-lg shadow-sm p-6">
@@ -213,7 +247,7 @@ const AnalysisResults = ({ results, onReset, fileName }) => {
                         <div className="ml-4">
                             <p className="text-sm font-medium text-gray-500">Total MSRP</p>
                             <p className="text-2xl font-semibold text-gray-900">
-                                {formatCurrency(summary?.totalMsrp || 0)}
+                                {formatCurrency(summary?.totalMSRP || 0)}
                             </p>
                         </div>
                     </div>
@@ -239,23 +273,9 @@ const AnalysisResults = ({ results, onReset, fileName }) => {
                             <CurrencyDollarIcon className="h-8 w-8 text-yellow-600" />
                         </div>
                         <div className="ml-4">
-                            <p className="text-sm font-medium text-gray-500">Suggested Purchase Price</p>
+                            <p className="text-sm font-medium text-gray-500">Suggested Max Purchase Price</p>
                             <p className="text-2xl font-semibold text-gray-900">
-                                {formatCurrency((summary?.projectedRevenue || 0) * 0.33)}
-                            </p>
-                        </div>
-                    </div>
-                </div>
-
-                <div className="bg-white rounded-lg shadow-sm p-6">
-                    <div className="flex items-center">
-                        <div className="flex-shrink-0">
-                            <TrendingUpIcon className="h-8 w-8 text-purple-600" />
-                        </div>
-                        <div className="ml-4">
-                            <p className="text-sm font-medium text-gray-500">Potential Profit Margin</p>
-                            <p className="text-2xl font-semibold text-gray-900">
-                                {formatPercentage(((summary?.projectedRevenue || 0) - ((summary?.projectedRevenue || 0) * 0.33)) / (summary?.projectedRevenue || 0) * 100)}
+                                {formatCurrency((summary?.projectedRevenue || 0) * 0.30)}
                             </p>
                         </div>
                     </div>
@@ -267,7 +287,7 @@ const AnalysisResults = ({ results, onReset, fileName }) => {
                             <ClockIcon className="h-8 w-8 text-orange-600" />
                         </div>
                         <div className="ml-4">
-                            <p className="text-sm font-medium text-gray-500">Avg. Sales Time</p>
+                            <p className="text-sm font-medium text-gray-500">80% Sellout Time</p>
                             <p className="text-2xl font-semibold text-gray-900">
                                 {summary?.avgSalesTime || 'N/A'}
                             </p>
@@ -333,11 +353,8 @@ const AnalysisResults = ({ results, onReset, fileName }) => {
                     <table className="min-w-full divide-y divide-gray-200">
                         <thead className="bg-gray-50">
                             <tr>
-                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-64">
                                     Item
-                                </th>
-                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                                    Image
                                 </th>
                                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                                     MSRP
@@ -396,33 +413,32 @@ const AnalysisResults = ({ results, onReset, fileName }) => {
                         <tbody className="bg-white divide-y divide-gray-200">
                             {sortedItems?.map((item, index) => (
                                 <tr key={index} className="hover:bg-gray-50">
-                                    <td className="px-6 py-4 whitespace-nowrap">
+                                    <td className="px-6 py-4">
                                         <div className="flex items-center">
-                                            <div>
+                                            <div className="flex-1 max-w-xs">
                                                 <div className="text-sm font-medium text-gray-900">
                                                     {item.item_number || item.sku}
                                                 </div>
-                                                <div className="text-sm text-gray-500 truncate max-w-xs">
-                                                    {item.title}
+                                                <div className="text-sm text-gray-500 flex items-center space-x-2">
+                                                    <a
+                                                        href={`https://www.google.com/search?q=${encodeURIComponent(item.title)}`}
+                                                        target="_blank"
+                                                        rel="noopener noreferrer"
+                                                        className="text-blue-600 hover:text-blue-800 underline truncate block"
+                                                        title={item.title}
+                                                    >
+                                                        {truncateText(item.title, 25)}
+                                                    </a>
+                                                    <button
+                                                        onClick={() => copyToClipboard(item.title)}
+                                                        className="text-gray-400 hover:text-gray-600 transition-colors flex-shrink-0"
+                                                        title="Copy full description"
+                                                    >
+                                                        <ClipboardDocumentIcon className="h-4 w-4" />
+                                                    </button>
                                                 </div>
                                             </div>
                                         </div>
-                                    </td>
-                                    <td className="px-6 py-4 whitespace-nowrap">
-                                        {item.analysis?.image?.thumbnail_url ? (
-                                            <div className="flex items-center">
-                                                <img
-                                                    src={item.analysis.image.thumbnail_url}
-                                                    alt={item.title}
-                                                    className="h-12 w-12 rounded-lg object-cover cursor-pointer hover:opacity-80 transition-opacity"
-                                                    onClick={() => openImageModal(item.analysis.image.original_url, item.title)}
-                                                />
-                                            </div>
-                                        ) : (
-                                            <div className="h-12 w-12 bg-gray-200 rounded-lg flex items-center justify-center">
-                                                <span className="text-gray-400 text-xs">No Image</span>
-                                            </div>
-                                        )}
                                     </td>
                                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
                                         {formatCurrency(item.msrp || 0)}
@@ -497,32 +513,6 @@ const AnalysisResults = ({ results, onReset, fileName }) => {
                             </li>
                         ))}
                     </ul>
-                </div>
-            )}
-
-            {/* Image Modal */}
-            {imageModal.isOpen && (
-                <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" onClick={closeImageModal}>
-                    <div className="bg-white rounded-lg max-w-4xl max-h-[90vh] overflow-hidden" onClick={(e) => e.stopPropagation()}>
-                        <div className="p-4 border-b border-gray-200 flex justify-between items-center">
-                            <h3 className="text-lg font-medium text-gray-900">{imageModal.title}</h3>
-                            <button
-                                onClick={closeImageModal}
-                                className="text-gray-400 hover:text-gray-600"
-                            >
-                                <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                                </svg>
-                            </button>
-                        </div>
-                        <div className="p-4">
-                            <img
-                                src={imageModal.imageUrl}
-                                alt={imageModal.title}
-                                className="max-w-full max-h-[70vh] object-contain mx-auto"
-                            />
-                        </div>
-                    </div>
                 </div>
             )}
         </div>
